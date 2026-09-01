@@ -331,7 +331,7 @@
   var adminBookingsCache = [];  // resultado da última consulta do painel do administrador
   var defaultRoomId = null;
   var notices = [];
-  var uiState = { page:'agenda', viewMode:'semana', anchor:new Date(), adminLoggedIn:false, adminFilter:'pendente', openMsgFor:null, lookupEmail:'' };
+  var uiState = { page:'agenda', viewMode:'semana', anchor:new Date(), adminLoggedIn:false, adminFilter:'pendente', openMsgFor:null, lookupEmail:'', confirmDeleteFor:null };
   var drawerState = { start:null, end:null };
 
   // ---------- Helpers de data ----------
@@ -427,7 +427,7 @@
       startTime: row.start_time, endTime: row.end_time, subject: row.subject, reason: row.reason,
       urgency: row.urgency, coffee: row.coffee, notes: row.notes, status: row.status,
       adminMessage: row.admin_message, accessToken: row.access_token,
-      googleEventLink: row.google_event_link || '',
+      googleEventLink: row.google_event_link || '', googleEventId: row.google_event_id || '',
       createdAt: row.created_at, updatedAt: row.updated_at
     };
   }
@@ -701,13 +701,44 @@
       throw new Error((errBody.error && errBody.error.message) || ('Erro '+res.status+' ao criar evento na Google Agenda.'));
     }
     var evt = await res.json();
-    return evt.htmlLink || null;
+    return { id: evt.id, link: evt.htmlLink || null };
   }
-  async function saveGoogleEventLink(id, link){
+  // Atualiza um evento já existente (usada quando o administrador edita
+  // uma reunião já aprovada e sincronizada). Lança erro se não conseguir —
+  // quem chama decide se isso bloqueia o fluxo ou só avisa.
+  async function updateGoogleCalendarEvent(eventId, b){
+    var token = await ensureGoogleToken();
+    if(!token) throw new Error('Google Agenda não conectada.');
+    var res = await fetch('https://www.googleapis.com/calendar/v3/calendars/'+encodeURIComponent(GOOGLE_CALENDAR_ID)+'/events/'+encodeURIComponent(eventId), {
+      method:'PATCH',
+      headers:{'Authorization':'Bearer '+token, 'Content-Type':'application/json'},
+      body: JSON.stringify(buildGoogleEventResource(b))
+    });
+    if(!res.ok){
+      if(res.status===401) clearGoogleToken();
+      var errBody = await res.json().catch(function(){ return {}; });
+      throw new Error((errBody.error && errBody.error.message) || ('Erro '+res.status+' ao atualizar evento na Google Agenda.'));
+    }
+  }
+  // Remove o evento (usada quando o administrador exclui uma reunião já
+  // sincronizada). 410 significa que o evento já não existia mais — trata
+  // como sucesso, não como erro.
+  async function deleteGoogleCalendarEvent(eventId){
+    var token = await ensureGoogleToken();
+    if(!token) throw new Error('Google Agenda não conectada.');
+    var res = await fetch('https://www.googleapis.com/calendar/v3/calendars/'+encodeURIComponent(GOOGLE_CALENDAR_ID)+'/events/'+encodeURIComponent(eventId), {
+      method:'DELETE', headers:{'Authorization':'Bearer '+token}
+    });
+    if(!res.ok && res.status!==410){
+      if(res.status===401) clearGoogleToken();
+      throw new Error('Erro '+res.status+' ao remover evento da Google Agenda.');
+    }
+  }
+  async function saveGoogleEvent(id, eventId, eventLink){
     var creds = getAdminCreds();
     try{
-      await sbRpc('admin_set_google_event', {p_email:creds.email, p_password:creds.password, p_booking_id:id, p_google_event_link: link||''});
-    }catch(e){ /* não bloqueia o fluxo principal de aprovação */ }
+      await sbRpc('admin_set_google_event', {p_email:creds.email, p_password:creds.password, p_booking_id:id, p_google_event_id: eventId||'', p_google_event_link: eventLink||''});
+    }catch(e){ /* não bloqueia o fluxo principal */ }
   }
 
   // ---------- Grade de horários (dia/semana) ----------
@@ -1058,6 +1089,15 @@
           ? '<a class="google-event-link" target="_blank" rel="noreferrer" href="'+escapeHtml(b.googleEventLink)+'">📅 Ver na Agenda do Google</a>'
           : '<a class="btn btn-google-outline" target="_blank" rel="noreferrer" href="'+buildGoogleUrlForAdmin(b)+'">📅 Adicionar à Agenda do Google</a>')+
         '</div>';
+      if(uiState.confirmDeleteFor===b.id){
+        html += '<div class="card-actions"><p class="muted" style="margin:0 0 8px;">Tem certeza que quer excluir esta reunião já aprovada? Isso não pode ser desfeito.</p>'+
+          '<div class="btn-row"><button class="btn btn-reject" data-action="admin-delete-confirm" data-id="'+b.id+'">Sim, excluir</button>'+
+          '<button class="btn" data-action="admin-delete-cancel">Cancelar</button></div></div>';
+      } else {
+        html += '<div class="card-actions btn-row">'+
+          '<button class="btn" data-action="admin-edit" data-id="'+b.id+'">✏️ Editar</button>'+
+          '<button class="btn btn-reject" data-action="admin-delete-open" data-id="'+b.id+'">🗑️ Excluir</button></div>';
+      }
     }
     if(canAct){
       if(openMsg){
@@ -1089,8 +1129,8 @@
     var finalMsg = toastMsg[status], finalKind = 'success';
     if(status==='aprovado' && b && googleEnabled()){
       try{
-        var link = await createGoogleCalendarEvent(b);
-        if(link){ await saveGoogleEventLink(id, link); finalMsg += ' Adicionada à Agenda do Google.'; }
+        var evt = await createGoogleCalendarEvent(b);
+        if(evt){ await saveGoogleEvent(id, evt.id, evt.link); finalMsg += ' Adicionada à Agenda do Google.'; }
         else finalMsg += ' Não deu para adicionar automaticamente à Agenda do Google (conecte em Configurações, ou use o link manual no card).';
       }catch(err){
         finalMsg += ' Falha ao adicionar à Agenda do Google: '+err.message;
@@ -1101,6 +1141,100 @@
       finalMsg += emailOk ? ' E-mail enviado ao solicitante.' : ' Não foi possível enviar o e-mail (verifique a função send-email no Supabase).';
     }
     toast(finalMsg, finalKind);
+    try{ await Promise.all([loadAdminBookings(), refreshBookings()]); }catch(e){}
+    renderView();
+  }
+  // ---------- Excluir / editar reunião já aprovada ----------
+  async function adminDeleteBooking(id){
+    var creds = getAdminCreds();
+    var b = adminBookingsCache.find(function(x){ return x.id===id; });
+    try{
+      await sbRpc('admin_delete_booking', {p_email:creds.email, p_password:creds.password, p_booking_id:id});
+    }catch(err){
+      toast('Não foi possível excluir: '+err.message, 'error');
+      return;
+    }
+    uiState.confirmDeleteFor = null;
+    var finalMsg = 'Reunião excluída.';
+    if(b && b.googleEventId && googleEnabled()){
+      try{ await deleteGoogleCalendarEvent(b.googleEventId); finalMsg += ' Evento removido da Agenda do Google.'; }
+      catch(err){ finalMsg += ' Não foi possível remover o evento da Agenda do Google: '+err.message; }
+    }
+    toast(finalMsg, 'success');
+    try{ await Promise.all([loadAdminBookings(), refreshBookings()]); }catch(e){}
+    renderView();
+  }
+  function renderAdminEditForm(b, errors, globalError){
+    errors = errors || {};
+    function err(k){ return errors[k] ? '<div class="field-error">'+escapeHtml(errors[k])+'</div>' : ''; }
+    function opt(val,label,cur){ return '<option value="'+val+'"'+(cur===val?' selected':'')+'>'+label+'</option>'; }
+    return '<form class="admin-edit-form form" data-id="'+b.id+'">'+
+      '<div class="field-row"><div class="field"><label>🕐 Início</label><input type="datetime-local" name="startTime" value="'+b.startTime+'" required>'+err('startTime')+'</div>'+
+      '<div class="field"><label>🕐 Término</label><input type="datetime-local" name="endTime" value="'+b.endTime+'" required>'+err('endTime')+'</div></div>'+
+      '<div class="field"><label>👤 Nome</label><input type="text" name="reqName" value="'+escapeHtml(b.requesterName)+'" required>'+err('requesterName')+'</div>'+
+      '<div class="field"><label>📱 Celular</label><input type="tel" name="reqPhone" value="'+escapeHtml(b.requesterPhone)+'" required>'+err('requesterPhone')+'</div>'+
+      '<div class="field"><label>📝 Tema</label><input type="text" name="subject" value="'+escapeHtml(b.subject)+'" required>'+err('subject')+'</div>'+
+      '<div class="field"><label>💬 Motivo</label><textarea name="reason" rows="2" required>'+escapeHtml(b.reason)+'</textarea>'+err('reason')+'</div>'+
+      '<div class="field"><label>⚠️ Grau de urgência</label><select name="urgency">'+opt('baixa','Baixa',b.urgency)+opt('media','Média',b.urgency)+opt('alta','Alta',b.urgency)+'</select></div>'+
+      '<div class="field"><label>☕ Café na sala</label><select name="coffee">'+opt('nenhum','Sem café',b.coffee)+opt('simples','Café simples',b.coffee)+opt('simples_acompanhamento','Café simples com acompanhamento',b.coffee)+opt('especial','Café especial',b.coffee)+'</select></div>'+
+      '<div class="field"><label>🗒️ Observações</label><textarea name="notes" rows="2">'+escapeHtml(b.notes||'')+'</textarea></div>'+
+      (globalError ? '<div class="global-error">'+escapeHtml(globalError)+'</div>' : '')+
+      '<button type="submit" class="btn btn-primary btn-block">Salvar alterações</button></form>';
+  }
+  function openAdminEdit(id){
+    var b = adminBookingsCache.find(function(x){ return x.id===id; });
+    if(!b){ toast('Reunião não encontrada — atualize a página.', 'error'); return; }
+    document.getElementById('drawerTitle').textContent = 'Editar reunião';
+    document.getElementById('drawerBody').innerHTML = renderAdminEditForm(b);
+    document.getElementById('overlay').classList.remove('hidden');
+    document.getElementById('drawer').classList.add('open');
+  }
+  async function handleAdminEdit(form){
+    var id = form.getAttribute('data-id');
+    var b = adminBookingsCache.find(function(x){ return x.id===id; });
+    if(!b) return;
+    var data = {
+      requesterName: form.reqName.value.trim(),
+      requesterPhone: form.reqPhone.value.trim(),
+      startTime: form.startTime.value,
+      endTime: form.endTime.value,
+      subject: form.subject.value.trim(),
+      reason: form.reason.value.trim(),
+      urgency: form.urgency.value,
+      coffee: form.coffee.value,
+      notes: form.notes.value.trim()
+    };
+    var errors = validateBooking(Object.assign({}, data, {requesterEmail:b.requesterEmail}));
+    if(Object.keys(errors).length){
+      document.getElementById('drawerBody').innerHTML = renderAdminEditForm(Object.assign({}, b, data), errors);
+      return;
+    }
+    if(hasApprovedOverlap(data.startTime, data.endTime, id)){
+      document.getElementById('drawerBody').innerHTML = renderAdminEditForm(Object.assign({}, b, data), {}, 'Esse novo horário já está aprovado para outra reunião.');
+      return;
+    }
+    var creds = getAdminCreds();
+    var updated;
+    try{
+      updated = await sbRpc('admin_edit_booking', {
+        p_email:creds.email, p_password:creds.password, p_booking_id:id,
+        p_start_time:data.startTime, p_end_time:data.endTime,
+        p_requester_name:data.requesterName, p_requester_phone:data.requesterPhone,
+        p_subject:data.subject, p_reason:data.reason, p_notes:data.notes,
+        p_urgency:data.urgency, p_coffee:data.coffee
+      });
+    }catch(err){
+      document.getElementById('drawerBody').innerHTML = renderAdminEditForm(Object.assign({}, b, data), {}, 'Não foi possível salvar: '+err.message);
+      return;
+    }
+    var nb = normalizeBooking(updated);
+    closeDrawer();
+    var finalMsg = 'Reunião atualizada.';
+    if(nb && nb.googleEventId && googleEnabled()){
+      try{ await updateGoogleCalendarEvent(nb.googleEventId, nb); finalMsg += ' Agenda do Google atualizada.'; }
+      catch(err){ finalMsg += ' Não foi possível atualizar o evento na Agenda do Google: '+err.message; }
+    }
+    toast(finalMsg, 'success');
     try{ await Promise.all([loadAdminBookings(), refreshBookings()]); }catch(e){}
     renderView();
   }
@@ -1293,6 +1427,10 @@
         break;
       }
       case 'admin-logout': uiState.adminLoggedIn=false; clearAdminCreds(); adminBookingsCache=[]; uiState.page='agenda'; renderView(); break;
+      case 'admin-edit': openAdminEdit(btn.getAttribute('data-id')); break;
+      case 'admin-delete-open': uiState.confirmDeleteFor = btn.getAttribute('data-id'); renderView(); break;
+      case 'admin-delete-cancel': uiState.confirmDeleteFor = null; renderView(); break;
+      case 'admin-delete-confirm': await adminDeleteBooking(btn.getAttribute('data-id')); break;
       case 'google-connect': await connectGoogleCalendar(); break;
       case 'google-disconnect': disconnectGoogleCalendar(); break;
       case 'download-ics': downloadIcs(myBookingsCache.find(function(b){ return b.id===btn.getAttribute('data-id'); })); break;
@@ -1311,6 +1449,7 @@
     else if(e.target && e.target.id==='changePassForm'){ e.preventDefault(); await handleChangePassword(e.target); }
     else if(e.target && e.target.id==='cleanupForm'){ e.preventDefault(); await handleCleanup(e.target); }
     else if(e.target && e.target.classList && e.target.classList.contains('resubmit-form')){ e.preventDefault(); await handleResubmit(e.target); }
+    else if(e.target && e.target.classList && e.target.classList.contains('admin-edit-form')){ e.preventDefault(); await handleAdminEdit(e.target); }
   });
 
   document.getElementById('overlay').addEventListener('click', closeDrawer);
