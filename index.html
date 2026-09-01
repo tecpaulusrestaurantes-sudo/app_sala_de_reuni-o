@@ -279,6 +279,12 @@
   var SUPABASE_URL = 'https://qtskcfcxpgncjvffmrpd.supabase.co';
   var SUPABASE_ANON_KEY = 'sb_publishable_heBh1fSA3DfpgN12ctrY6A_szV5DB4p';
   var REST = SUPABASE_URL + '/rest/v1';
+  // E-mail de verdade: chama a Edge Function "send-email" publicada no
+  // mesmo projeto Supabase (ver supabase/functions/send-email/index.ts —
+  // lá tem o passo a passo de como publicar e configurar o Resend). Sem
+  // publicar essa função, os avisos continuam só no sino 🔔 deste
+  // navegador, sem quebrar nada.
+  var SEND_EMAIL_URL = SUPABASE_URL + '/functions/v1/send-email';
 
   // ---------- Google Agenda (opcional) ----------
   // Integração com a agenda compartilhada do Google
@@ -446,17 +452,40 @@
     adminBookingsCache = normalizeBookings(rows);
   }
 
-  // ---------- Notificações simuladas ----------
-  // Isto continua sendo só uma simulação local (mostrada no sino 🔔 deste
-  // navegador) — envio de verdade por e-mail/WhatsApp exige credenciais
-  // que não podem ficar visíveis num arquivo HTML público. Para isso de
-  // verdade, veja a versão com backend Next.js.
+  // ---------- Histórico de avisos (sino 🔔) ----------
+  // Isto é só um registro local, neste navegador, do que já foi avisado —
+  // não é o envio em si. O envio de e-mail de verdade acontece à parte,
+  // pela Edge Function "send-email" (ver sendRealEmail() logo abaixo); o
+  // WhatsApp continua sendo sempre um link manual (não existe envio
+  // automático de WhatsApp sem a API oficial paga do WhatsApp Business).
   function loadNotices(){ try{ return JSON.parse(localStorage.getItem(NOTICE_KEY)) || []; }catch(e){ return []; } }
   function saveNotices(){ localStorage.setItem(NOTICE_KEY, JSON.stringify(notices.slice(-50))); }
   function addNotice(to, subject, body, phone){
     notices.push({to:to, subject:subject, body:body||'', phone:phone||'', at:new Date().toISOString()});
     saveNotices();
-    toast('✉️ E-mail simulado enviado para ' + to);
+  }
+  // Chama a Edge Function que manda o e-mail de verdade pelo Resend (ver
+  // supabase/functions/send-email/index.ts). O navegador só informa QUAL
+  // evento aconteceu e sua prova de autorização (access_token de quem
+  // acabou de criar a solicitação, ou a senha do administrador) — quem
+  // decide o destinatário e o texto do e-mail é sempre a função, a partir
+  // do que está de verdade no banco, nunca do que o navegador manda.
+  // Retorna true/false e nunca lança erro — se a função ainda não foi
+  // publicada, ou o Resend não está configurado, o site continua
+  // funcionando normalmente, só sem esse envio (fica registrado no
+  // console do navegador, F12, para diagnóstico).
+  async function sendRealEmail(payload){
+    try{
+      var res = await fetch(SEND_EMAIL_URL, { method:'POST', headers: sbHeaders(), body: JSON.stringify(payload) });
+      if(!res.ok){
+        var errBody = await res.json().catch(function(){ return {}; });
+        throw new Error(errBody.error || ('Erro '+res.status));
+      }
+      return true;
+    }catch(e){
+      console.warn('Não foi possível enviar e-mail real:', e.message);
+      return false;
+    }
   }
   function renderNoticesList(){
     var list = document.getElementById('noticesList');
@@ -904,13 +933,14 @@
     }
     var submitBtn = document.querySelector('#bookingForm button[type=submit]');
     if(submitBtn){ submitBtn.disabled = true; submitBtn.textContent = 'Enviando…'; }
+    var accessToken = uid();
     try{
       await sbInsert('bookings', {
         room_id: defaultRoomId,
         requester_email: data.requesterEmail, requester_name: data.requesterName, requester_phone: data.requesterPhone,
         start_time: data.startTime, end_time: data.endTime, subject: data.subject, reason: data.reason,
         urgency: data.urgency, coffee: data.coffee, notes: data.notes,
-        status: 'pendente', admin_message: '', access_token: uid()
+        status: 'pendente', admin_message: '', access_token: accessToken
       });
     }catch(err){
       document.getElementById('drawerBody').innerHTML = renderDrawerForm(safeStart, safeEnd, data, {}, 'Não foi possível enviar sua solicitação: '+err.message);
@@ -918,6 +948,7 @@
     }
     addNotice('admin@paulusrestaurantes.com.br', 'Nova solicitação: '+data.subject, 'De '+data.requesterName+', '+fmtDateTime(parseLocal(data.startTime))+' até '+fmtHM(parseLocal(data.endTime)));
     addNotice(data.requesterEmail, 'Solicitação recebida: '+data.subject, 'Acompanhe pelo menu "Minhas solicitações" usando seu e-mail.', data.requesterPhone);
+    sendRealEmail({kind:'nova_solicitacao', access_token: accessToken});
     document.getElementById('drawerBody').innerHTML =
       '<div class="success-box">Solicitação enviada! Você pode acompanhar o status a qualquer momento em "Minhas solicitações", usando o e-mail <b>'+escapeHtml(data.requesterEmail)+'</b>.</div>'+
       '<button class="btn btn-primary btn-block" data-action="close-drawer">Fechar</button>';
@@ -1065,6 +1096,10 @@
         finalMsg += ' Falha ao adicionar à Agenda do Google: '+err.message;
       }
     }
+    if(b){
+      var emailOk = await sendRealEmail({kind:'status', booking_id:id, admin_email:creds.email, admin_password:creds.password});
+      finalMsg += emailOk ? ' E-mail enviado ao solicitante.' : ' Não foi possível enviar o e-mail (verifique a função send-email no Supabase).';
+    }
     toast(finalMsg, finalKind);
     try{ await Promise.all([loadAdminBookings(), refreshBookings()]); }catch(e){}
     renderView();
@@ -1175,6 +1210,7 @@
       return;
     }
     addNotice('admin@paulusrestaurantes.com.br', 'Solicitação reenviada: '+data.subject, '');
+    if(b.accessToken) sendRealEmail({kind:'nova_solicitacao', access_token: b.accessToken});
     toast('Solicitação reenviada para aprovação!', 'success');
     await handleLookup(b.requesterEmail);
   }
