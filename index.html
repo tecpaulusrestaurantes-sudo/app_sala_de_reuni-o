@@ -279,12 +279,14 @@
   var SUPABASE_URL = 'https://qtskcfcxpgncjvffmrpd.supabase.co';
   var SUPABASE_ANON_KEY = 'sb_publishable_heBh1fSA3DfpgN12ctrY6A_szV5DB4p';
   var REST = SUPABASE_URL + '/rest/v1';
-  // E-mail de verdade: chama a Edge Function "send-email" publicada no
-  // mesmo projeto Supabase (ver supabase/functions/send-email/index.ts —
-  // lá tem o passo a passo de como publicar e configurar o Resend). Sem
-  // publicar essa função, os avisos continuam só no sino 🔔 deste
+  // E-mail de verdade: chama a Edge Function publicada no mesmo projeto
+  // Supabase (ver supabase/functions/send-email/index.ts — lá tem o passo
+  // a passo de como publicar e configurar o Resend). O nome abaixo precisa
+  // ser IDÊNTICO ao nome que a função tem no painel do Supabase, em "Edge
+  // Functions" — se publicar de novo com outro nome, atualize aqui também.
+  // Sem publicar essa função, os avisos continuam só no sino 🔔 deste
   // navegador, sem quebrar nada.
-  var SEND_EMAIL_URL = SUPABASE_URL + '/functions/v1/send-email';
+  var SEND_EMAIL_URL = SUPABASE_URL + '/functions/v1/resend-email';
 
   // ---------- Google Agenda (opcional) ----------
   // Integração com a agenda compartilhada do Google
